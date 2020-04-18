@@ -1,11 +1,9 @@
 #-*- coding:utf-8 -*-
 """model.py: the simplest example for the capsule network"""
+# from https://github.com/ageron/handson-ml/blob/master/extra_capsnets.ipynb
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-
-__author__ = "Kyungmin Lee"
-__email__ = "sephiroce@snu.ac.kr"
 
 caps1_n_maps = 32
 caps1_n_dims = 8
@@ -16,7 +14,6 @@ caps2_n_dims = 16
 m_plus = 0.9
 m_minus = 0.1
 lambda_ = 0.5
-
 
 
 class ConvolutionalLayers(tf.keras.layers.Layer):
