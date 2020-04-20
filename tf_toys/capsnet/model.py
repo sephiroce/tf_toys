@@ -16,6 +16,7 @@ n_caps1 = caps1_n_maps * 6 * 6
 
 def main():
   #pylint: disable=too-many-locals
+  batch_size = 50
   tf.random.set_seed(42)
 
   mnist_builder = tfds.builder("mnist")
@@ -23,17 +24,18 @@ def main():
   ds_train = mnist_builder.as_dataset(split="train")
   ds_test = mnist_builder.as_dataset(split="test")
 
-  ds_train = ds_train.repeat(1).shuffle(1024).batch(128)
+  ds_train = ds_train.repeat(1).shuffle(1024).batch(batch_size)
   ds_train = ds_train.prefetch(tf.data.experimental.AUTOTUNE)
 
-  ds_test = ds_test.repeat(1).batch(128)
+  ds_test = ds_test.repeat(1).batch(batch_size)
   ds_test = ds_test.prefetch(tf.data.experimental.AUTOTUNE)
 
   caps_net = CapsuleNetwork()
-  optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.9,
-                                       beta_2=0.999, epsilon=1e-07)
-  loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+  optimizer = tf.keras.optimizers.Adam()
+  loss_object =\
+    tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
+  n_iterations_per_epoch = 55000 // batch_size
   @tf.function
   def train(inputs, loss_state, acc_state, training=True):
     image = tf.cast(inputs["image"], tf.float32)
@@ -62,12 +64,14 @@ def main():
                                   name="recon_loss")
 
       alpha = 5e-4
-      loss = margin_loss + alpha * recon_loss
-
+      #loss = margin_loss + alpha * recon_loss
+      loss = margin_loss
+      #tf.print(margin_loss, recon_loss)
     grads = tape.gradient(loss, caps_net.trainable_variables)
     optimizer.apply_gradients(zip(grads, caps_net.trainable_variables))
 
     loss_state.update_state(loss)
+    y_pred = tf.squeeze(y_pred, axis=-1)
     correct = tf.equal(tf.cast(targets, tf.float32),
                        tf.cast(y_pred, tf.float32), name="correct")
     accuracy = tf.reduce_mean(tf.cast(correct, tf.float32), name="accuracy")
@@ -78,22 +82,13 @@ def main():
     epoch_accuracy = tf.keras.metrics.Mean()
     for idx, datum in enumerate(iter(ds_train)):
       train(datum, epoch_loss_avg, epoch_accuracy)
-      #print("loss %.3f, accuracy %.3f" % (epoch_loss_avg.result(),
-      #                                    epoch_accuracy.result()))
+      print('\rIteration: %d/%d loss %.3f accuracy %.3f' % (idx + 1,
+                                                          n_iterations_per_epoch,
+                                                          epoch_loss_avg.result(),
+                                                          epoch_accuracy.result() * 100.0),
+                                                            end="")
     print("Epoch %d loss %.3f, accuracy %.3f"%(epoch, epoch_loss_avg.result(),
                                                epoch_accuracy.result()))
-  loss_state = tf.keras.metrics.Mean()
-  acc_state = tf.keras.metrics.SparseCategoricalAccuracy()
-
-  for inputs in iter(ds_test):
-    input_image = tf.cast(inputs["image"], tf.float32)
-    input_label = tf.cast(inputs["label"], tf.float32)
-    y_pred = caps_net(input_image)
-    loss = loss_object(input_label, y_pred)
-    loss_state.update_state(loss)
-    acc_state.update_state(input_label, y_pred)
-  print("Test loss %.3f, acc %.3f" % (loss_state.result(), acc_state.result()))
-
 
 if __name__ == "__main__":
   main()
