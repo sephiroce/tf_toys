@@ -59,6 +59,7 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     X = inputs[0]
     Y = inputs[1]
     batch_size = tf.shape(X)[0]
+    training = kwargs["training"]
 
     # CapsuleizationLayer
     conv1 = self.conv1(X)
@@ -103,7 +104,7 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     y_pred = tf.squeeze(y_proba_argmax, axis=[1, 2])
 
     # Reconstruction Network
-    reconstruction_targets = Y
+    reconstruction_targets = Y if training else y_pred
     reconstruction_mask = tf.one_hot(reconstruction_targets, depth=caps2_n)
     reconstruction_mask_reshaped = tf.reshape(reconstruction_mask,
                                               [-1, 1, caps2_n, 1, 1])
@@ -118,12 +119,12 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     return caps2_output, y_pred, dec_out
 
 @tf.function
-def train(inputs, model, optimizer):
+def train(inputs, model, optimizer, training=True):
   X = tf.reshape(tf.cast(inputs[0], tf.float32), [-1, 28, 28, 1])
   Y = tf.cast(inputs[1], tf.int64)
 
   with tf.GradientTape() as tape:
-    caps2_output, y_pred, dec_out = model((X, Y))
+    caps2_output, y_pred, dec_out = model((X, Y), training=training)
 
     # Loss: Margin loss
     T = tf.one_hot(Y, depth=caps2_n)
@@ -161,21 +162,41 @@ def main():
 
   batch_size = 50
   n_iterations_per_epoch = mnist.train.num_examples // batch_size
+  n_iterations_validation = mnist.validation.num_examples // batch_size
+  best_loss_val = 1e14
 
-  for epoch in range(1, 5):
-    epoch_loss_avg = tf.keras.metrics.Mean(name='train_loss')
-    epoch_accuracy = tf.keras.metrics.Mean(name='train_acc')
+  for epoch in range(1, 10):
+    train_avg_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_avg_accu = tf.keras.metrics.Mean(name='train_acc')
     for idx in range(1, n_iterations_per_epoch + 1):
       X_batch, Y_batch = mnist.train.next_batch(batch_size)
       loss, acc = train((X_batch, Y_batch), caps_net, opti)
-      epoch_loss_avg.update_state(loss)
-      epoch_accuracy.update_state(acc)
-      print('\rIteration: %d/%d loss %.3f accuracy %.3f' % (idx,
-                                                          n_iterations_per_epoch,
-                                                          loss, acc * 100.0),
+      train_avg_loss.update_state(loss)
+      train_avg_accu.update_state(acc)
+      print('\rTraining the model: %d/%d Loss %.3f '
+            'Acc %.3f' % (idx, n_iterations_per_epoch, loss, acc * 100.0),
             end="")
-    print("Epoch %d loss %.3f, accuracy %.3f"%(epoch, epoch_loss_avg.result(),
-                                               epoch_accuracy.result()))
+    print("\nEpoch: %d Loss %.3f, Acc %.3f"%(epoch, train_avg_loss.result(),
+                                             train_avg_accu.result()))
+
+    valid_avg_loss = tf.keras.metrics.Mean(name='valid_loss')
+    valid_avg_accu = tf.keras.metrics.Mean(name='valid_acc')
+    # At the end of each epoch,
+    # measure the validation loss and accuracy:
+    for idx in range(1, n_iterations_validation + 1):
+      X_batch, Y_batch = mnist.validation.next_batch(batch_size)
+      loss, acc = train((X_batch, Y_batch), caps_net, opti, False)
+      valid_avg_loss.update_state(loss)
+      valid_avg_accu.update_state(acc)
+      print("\rEvaluating the model: {}/{} ({:.1f}%)".format(
+        idx, n_iterations_validation, idx * 100 / n_iterations_validation),
+        end=" " * 10)
+    print("\rEpoch: {}  Val accuracy: {:.4f}%  Loss: {:.6f}{}".format(
+      epoch, valid_avg_accu.result() * 100, valid_avg_loss.result(),
+      " (improved)" if valid_avg_loss.result() < best_loss_val else ""))
+
+    if valid_avg_loss.result() < best_loss_val:
+      best_loss_val = valid_avg_loss.result()
 
 if __name__ == "__main__":
   main()
