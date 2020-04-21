@@ -230,7 +230,7 @@ def main():
   n_iterations_test = mnist.test.num_examples // batch_size
   best_loss_val = 1e14
 
-  epoch = 1
+  epoch = 10
 
   # Training
   for epoch in range(1, epoch + 1):
@@ -268,7 +268,6 @@ def main():
 
   print("Evaluation!")
   # Evaluation
-  """
   test_avg_loss = tf.keras.metrics.Mean(name='test_loss')
   test_avg_accu = tf.keras.metrics.Mean(name='test_acc')
   for idx in range(1, n_iterations_test + 1):
@@ -282,7 +281,6 @@ def main():
           end=" " * 10)
   print("\rFinal test accuracy: {:.4f}%  Loss: {:.6f}".format(
     test_avg_accu.result() * 100, test_avg_loss.result()))
-  """
 
   # Predictions
   n_samples = 5
