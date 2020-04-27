@@ -1,14 +1,15 @@
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
 import time
 import numpy as np
 
-caps1_n = 32 # number of capsules
-caps1_dim = 8 # dimension of capsules
-caps2_n = 10 # class number
-caps2_dim = 16 # dimension of capsules
+caps1_n = 32
+caps1_dim = 8
+caps2_n = 10
+caps2_dim = 16
 exp_caps1_n = caps1_n * 6 * 6  # 1152 primary capsules
-dec_out_dim = 28 * 28
+dec_out_dim = 32 * 32
 routing_iter = 2
 
 def squash(s, axis=-1, epsilon=1e-7):
@@ -18,7 +19,7 @@ def squash(s, axis=-1, epsilon=1e-7):
   unit_vector = s / safe_norm
   return squash_factor * unit_vector
 
-def length(s, axis=-1, epsilon=1e-7, keepdims=False):
+def safe_norm(s, axis=-1, epsilon=1e-7, keepdims=False):
   squared_norm = tf.reduce_sum(tf.square(s), axis=axis, keepdims=keepdims)
   return tf.sqrt(squared_norm + epsilon)
 
@@ -31,7 +32,6 @@ class ReconstructionLayer(tf.keras.layers.Layer):
 
   def call(self, inputs, **kwargs):
     caps2_output, reconstruction_targets = inputs
-    reconstruction_targets = tf.cast(reconstruction_targets, tf.int32)
     reconstruction_mask = tf.one_hot(reconstruction_targets, depth=caps2_n)
     reconstruction_mask_reshaped = tf.reshape(reconstruction_mask,
                                               [-1, 1, caps2_n, 1, 1])
@@ -44,6 +44,26 @@ class ReconstructionLayer(tf.keras.layers.Layer):
     dec_out = self.dense3(hidden2)
     return dec_out
 
+""" For while loop
+def condition(u_hat, weight, counter, caps_output):
+  return tf.less_equal(counter, routing_iter)
+
+def loop_body(u_hat, raw_weights, counter, caps_output):
+  # Round1, Line 4
+  routing_weights = tf.nn.softmax(raw_weights, axis=2)
+  # Round1, Line 5
+  weighted_predictions = tf.multiply(routing_weights, u_hat)
+  weighted_sum = tf.reduce_sum(weighted_predictions, axis=1, keepdims=True)
+  # Round1, Line 6
+  caps2_output_round_1 = squash(weighted_sum, axis=-2)
+  # Round1, Line 7
+  caps2_output_round_1_tiled = tf.tile(caps2_output_round_1,
+                                       [1, exp_caps1_n, 1, 1, 1])
+  raw_weights2 = raw_weights + tf.matmul(u_hat, caps2_output_round_1_tiled,
+                                         transpose_a=True)
+  return u_hat, raw_weights2, tf.add(counter, 1), caps2_output_round_1
+"""
+
 class CapsuleNetwork(tf.keras.layers.Layer):
   def __init__(self):
     super(CapsuleNetwork, self).__init__()
@@ -53,7 +73,8 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     self.conv2 = tf.keras.layers.Conv2D(filters=caps1_n * caps1_dim,
                                         kernel_size=[9, 9], strides=[2, 2],
                                         padding="valid", activation="relu")
-    self.wgt = tf.Variable(tf.random.normal(shape=(1, exp_caps1_n, caps2_n, caps2_dim, caps1_dim),
+    self.wgt = tf.Variable(tf.random.normal(shape=(1, exp_caps1_n, caps2_n,
+                                                   caps2_dim, caps1_dim),
                                             stddev=0.1, dtype=tf.float32),
                            trainable=True)
     self.recon_ = ReconstructionLayer()
@@ -79,21 +100,26 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     caps1_output_tiled = tf.tile(caps1_output_tile, [1, 1, caps2_n, 1, 1])
     u_hat = tf.matmul(W_tiled, caps1_output_tiled)
 
-
     # ==========================================================================
     # Dynamic Routing
     # ==========================================================================
     raw_weights = tf.zeros([batch_size, exp_caps1_n, caps2_n, 1, 1],
                             dtype=tf.float32)
+    #dummy_value = tf.zeros([batch_size, 1, caps2_n, caps2_dim, 1])
+    #counter = tf.constant(1)
+    #_, _, _, caps2_output1 = tf.while_loop(condition, loop_body,
+    #                                      [u_hat, raw_weights1, counter,
+    #                                       dummy_value])
     # Round1, Line 4
     routing_weights = tf.nn.softmax(raw_weights, axis=2)
     # Round1, Line 5
     weighted_predictions = tf.multiply(routing_weights, u_hat)
-    weighted_sum = tf.reduce_sum(weighted_predictions, axis=1,
+    caps2_output = weighted_sum = tf.reduce_sum(weighted_predictions, axis=1,
                                               keepdims=True)
     # Round1, Line 6
-    caps2_output_round_1= squash(weighted_sum, axis=-2)
+    #caps2_output = caps2_output_round_1= squash(weighted_sum, axis=-2)
     # Round1, Line 7
+    """
     caps2_output_round_1_tiled = tf.tile(caps2_output_round_1, [1, exp_caps1_n, 1, 1, 1])
     raw_weights2 = raw_weights + tf.matmul(u_hat, caps2_output_round_1_tiled, transpose_a=True)
     # Round2, Line 4
@@ -103,10 +129,13 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     weighted_sum_round_2 = tf.reduce_sum(weighted_predictions_round_2, axis=1, keepdims=True)
     # Round2, Line 6
     caps2_output = squash(weighted_sum_round_2, axis=-2)
+    """
+    #total_dim = tf.cast(tf.reduce_prod(tf.shape(caps2_output)), tf.int64)
+    #tf.print("NOT EQUAL:", total_dim - tf.math.count_nonzero(tf.equal(
+    #  caps2_output, caps2_output1)))
     # ==========================================================================
-    #tf.print(tf.shape(caps2_output))
 
-    y_proba = length(caps2_output, axis=-2)
+    y_proba = safe_norm(caps2_output, axis=-2)
     y_proba_argmax = tf.argmax(y_proba, axis=2)
     y_pred = tf.squeeze(y_proba_argmax, axis=[1, 2])
 
@@ -117,9 +146,8 @@ class CapsuleNetwork(tf.keras.layers.Layer):
 def loss_function(X, Y, caps2_output, dec_out, y_pred):
   # Loss: Margin loss
   m_plus, m_minus, lambda_ = 0.9, 0.1, 0.5
-  Y = tf.cast(Y, tf.int32)
   T = tf.one_hot(Y, depth=caps2_n)
-  caps2_output_norm = length(caps2_output, axis=-2, keepdims=True)
+  caps2_output_norm = safe_norm(caps2_output, axis=-2, keepdims=True)
   present_error_raw = tf.square(tf.maximum(0., m_plus - caps2_output_norm))
   present_error = tf.reshape(present_error_raw, shape=(-1, 10))
   absent_error_raw = tf.square(tf.maximum(0., caps2_output_norm - m_minus))
@@ -135,7 +163,6 @@ def loss_function(X, Y, caps2_output, dec_out, y_pred):
   # Final Loss
   alpha = 0.0005
   loss = margin_loss + alpha * reconstruction_loss
-  y_pred = tf.cast(y_pred, tf.int32)
   correct = tf.equal(Y, y_pred)
   accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
   return loss, accuracy
@@ -143,7 +170,8 @@ def loss_function(X, Y, caps2_output, dec_out, y_pred):
 @tf.function
 def train(inputs, model, optimizer):
   X = tf.cast(inputs["image"], tf.float32)
-  Y = tf.cast(inputs["label"], tf.float32)
+  tf.print(tf.shape(X))
+  Y = tf.cast(inputs["label"], tf.int64)
 
   with tf.GradientTape() as tape:
     caps2_output, dec_out, y_pred = model((X, Y), training=True)
@@ -199,7 +227,7 @@ def main():
   #pylint: disable=too-many-locals
   tf.random.set_seed(42)
 
-  mnist_builder = tfds.builder("mnist")
+  mnist_builder = tfds.builder("cifar10")
   mnist_builder.download_and_prepare()
   ds_train = mnist_builder.as_dataset(split="train")
   ds_test = mnist_builder.as_dataset(split="test")
