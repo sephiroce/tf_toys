@@ -4,6 +4,7 @@ from tf_toys.capsnet.helper_train import unfold, squash
 
 eps = 1e-12
 
+
 class DynamicRouting2d(tf.keras.layers.Layer):
   def __init__(self, A, B, C, D, kernel_size=1, stride=1, padding=1, iters=3, std_dev=1.0):
     super(DynamicRouting2d, self).__init__()
@@ -171,6 +172,41 @@ class EmRouting2d(tf.keras.layers.Layer):
     # [b, l, kkA, B, 1]
     return tf.expand_dims(r, -1)
 
+  def em_iteration(self, v, a_in, r):
+    """
+    Iteration range is from 1 to 4.
+
+    # the below line is from open review
+    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
+    :param v:
+    :param a_in:
+    :param r:
+    :return:
+    """
+    if self.iters < 0 or self.iters > 3:
+      return None, None
+
+    i = 0
+    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
+    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
+    if self.iters == 1:
+      return a_out, pose_out
+
+    i = 1
+    r = self.e_step(v, a_out, pose_out, sigma_sq)
+    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
+    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
+    if self.iters == 2:
+      return a_out, pose_out
+
+    i = 2
+    r = self.e_step(v, a_out, pose_out, sigma_sq)
+    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
+    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
+    if self.iters == 3:
+      return a_out, pose_out
+
+
   def call(self, inputs, **kwargs):
     a_in, pose = inputs
 
@@ -207,14 +243,9 @@ class EmRouting2d(tf.keras.layers.Layer):
     a_in = tf.reshape(a_in, (b, l, self.kkA))
 
     r = tf.ones((b, l, self.kkA, self.B, 1), dtype=a_in.dtype)
-    """
-        for i in range(self.iters):
-            # this is from open review
-            self.lambda_ = self.final_lambda * (1 - 0.95 ** (i+1)) 
-            a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
-            if i < self.iters - 1:
-                r = self.e_step(v, a_out, pose_out, sigma_sq)
-    """
+
+    # I will fix it
+    a_out, pose_out = self.em_iteration(v, a_in, r)
 
     # [b, l, B*psize]
     pose_out = tf.reshape(tf.expand_dims(pose_out, 2), (b, l, -1))
@@ -226,10 +257,9 @@ class EmRouting2d(tf.keras.layers.Layer):
     oh = ow = tf.cast(tf.floor(l ** (1.0 / 2)), tf.int32)
 
     a_out = tf.reshape(a_out, (b, -1, oh, ow))
-    pose_out = tf.rehsape(pose_out, (b, -1, oh, ow))
+    pose_out = tf.reshape(pose_out, (b, -1, oh, ow))
 
     return a_out, pose_out
-
 
 class SelfRouting2d(tf.keras.layers.Layer):
   def __init__(self, A, B, C, D, kernel_size=3, stride=1, padding=1, pose_out=False):

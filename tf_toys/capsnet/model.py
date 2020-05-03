@@ -338,13 +338,13 @@ class ConvNet(tf.keras.layers.Layer):
         #nn.init.normal_(self.conv_layers[0].W, 0, 0.5)
       elif self.mode == 'EM':
         self.conv_layers.append(
-          EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, strides=1,
+          EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, stride=1,
                       padding=1))
         self.norm_layers.append(tf.keras.layers.BatchNormalization())
       elif self.mode == 'SR':
         self.conv_layers.append(
           SelfRouting2d(num_caps, num_caps, caps_size, caps_size, kernel_size=3,
-                        strides=1, padding=1, pose_out=True))
+                        stride=1, padding=1, pose_out=True))
         self.norm_layers.append(tf.keras.layers.BatchNormalization())
       else:
         break
