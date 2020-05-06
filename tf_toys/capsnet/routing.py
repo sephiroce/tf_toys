@@ -24,10 +24,12 @@ class DynamicRouting2d(tf.keras.layers.Layer):
 
     self.iters = iters
 
-    init=tf.keras.initializers.he_uniform(seed=None)
-    self.W = tf.Variable(init(shape=(self.kkA, B * D, C)), trainable=True)
-    #self.W = nn.Parameter(torch.FloatTensor(self.kkA, B * D, C))
-    #nn.init.kaiming_uniform_(self.W)
+    if std_dev == 1.0:
+      init=tf.keras.initializers.he_uniform(seed=None)
+      self.W = tf.Variable(init(shape=(self.kkA, B * D, C)), trainable=True)
+    else:
+      self.W = tf.Variable(tf.random.normal([self.kkA, B * D, C], mean=0.0,
+                                            stddev=std_dev), trainable=True)
 
   def call(self, inputs, **kwargs):
     # x: [b, AC, h, w]
@@ -140,9 +142,9 @@ class EmRouting2d(tf.keras.layers.Layer):
     sigma_sq = tf.reduce_sum(coeff * (v - mu) ** 2, axis=2, keepdims=True) + eps
 
     # [b, l, B, 1]
-    r_sum = tf.squeeze(r_sum)[2]
+    r_sum = tf.squeeze(r_sum, 2)
     # [b, l, B, psize]
-    sigma_sq = tf.squeeze(sigma_sq)[2]
+    sigma_sq = tf.squeeze(sigma_sq, 2)
     # [1, 1, B, 1] + [b, l, B, psize] * [b, l, B, 1]
     cost_h = (self.beta_u + tf.math.log(tf.math.sqrt(sigma_sq))) * r_sum
 
@@ -168,7 +170,7 @@ class EmRouting2d(tf.keras.layers.Layer):
     # [b, l, kkA, B]
     ln_ap = ln_p_j + tf.math.log(tf.reshape(a_out, (b, l, 1, self.B)))
     # [b, l, kkA, B]
-    r = tf.nn.softmax(ln_ap, dim=-1)
+    r = tf.nn.softmax(ln_ap, axis=-1)
     # [b, l, kkA, B, 1]
     return tf.expand_dims(r, -1)
 
@@ -254,12 +256,14 @@ class EmRouting2d(tf.keras.layers.Layer):
     # [b, B, l]
     a_out = tf.transpose(a_out, (0, 2, 1))
 
+    l = tf.cast(l, tf.float32)
     oh = ow = tf.cast(tf.floor(l ** (1.0 / 2)), tf.int32)
 
     a_out = tf.reshape(a_out, (b, -1, oh, ow))
     pose_out = tf.reshape(pose_out, (b, -1, oh, ow))
 
     return a_out, pose_out
+
 
 class SelfRouting2d(tf.keras.layers.Layer):
   def __init__(self, A, B, C, D, kernel_size=3, stride=1, padding=1, pose_out=False):
@@ -290,6 +294,7 @@ class SelfRouting2d(tf.keras.layers.Layer):
     # pose: [b, AC, h, w]
     a, pose = inputs
     b, h, w = tf.shape(a)[0], tf.shape(a)[2], tf.shape(a)[3]
+    pose_out = None
 
     # [b, ACkk, l]
     pose = unfold(pose, self.k, stride=self.stride, padding=self.pad)
@@ -301,15 +306,14 @@ class SelfRouting2d(tf.keras.layers.Layer):
     # [b, l, kkA, C, 1]
     pose = tf.reshape(pose, (b, l, self.kkA, self.C, 1))
 
-    pose_out = None
     if hasattr(self, 'W1'):
       # [b, l, kkA, BD]
-      pose_out = tf.squeeze(tf.matmul(self.W1, pose))[-1]
+      pose_out = tf.squeeze(tf.matmul(self.W1, pose), -1)
       # [b, l, kkA, B, D]
       pose_out = tf.reshape(pose_out, (b, l, self.kkA, self.B, self.D))
 
     # [b, l, kkA, B]
-    logit = tf.squeeze(tf.matmul(self.W2, pose))[-1] + self.b2
+    logit = tf.squeeze(tf.matmul(self.W2, pose), -1) + self.b2
 
     # [b, l, kkA, B]
     r = tf.nn.softmax(logit, axis=3)

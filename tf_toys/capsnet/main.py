@@ -1,3 +1,4 @@
+import math
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import time
@@ -39,7 +40,6 @@ def evaluation(inputs, model, loss_func, loss_state, acc_state):
   loss_state.update_state(loss)
   acc_state.update_state(acc)
 
-
 def main(config):
   #pylint: disable=too-many-locals
   """python3 main.py --dataset=cifar10 --name=resnet_[routing_method] --is_train=False"""
@@ -60,12 +60,12 @@ def main(config):
   ds_test = ds_test.repeat(1).batch(config.batch_size)
   ds_test = ds_test.prefetch(tf.data.experimental.AUTOTUNE)
   if config.dataset in ["cifar10", "svhn_cropped", "smallnorb"]:
-    train_data_number = 60000
+    train_data_number = 50000
     test_data_number = 5000
   else:
     raise NotImplementedError
-  n_iterations_per_epoch = train_data_number // config.batch_size
-  n_iterations_test = n_iterations_validation = test_data_number // config.batch_size
+  train_steps_per_epoch = math.ceil(train_data_number / config.batch_size)
+  n_iterations_test = vaild_steps_per_epoch = math.ceil(test_data_number / config.batch_size)
 
   # training params
   epochs = config.epochs
@@ -78,7 +78,7 @@ def main(config):
   best = config.best
   ckpt_dir = config.ckpt_dir
   logs_dir = config.logs_dir
-  best_valid_acc = -1e13
+  best_valid_loss = 1e13
   counter = 0
   train_patience = config.train_patience
   resume = config.resume
@@ -106,6 +106,12 @@ def main(config):
     raise NotImplementedError("Unknown model postfix")
 
   model = Model.create(name=name, conf=config, mode=mode)
+  for i, datum in enumerate(iter(ds_test)):
+    model(tf.cast(datum["image"], tf.float32))
+    break
+  for _ in iter(ds_test):
+    continue
+  model.summary()
 
   lr = 1e-3
   loss_func = None
@@ -134,12 +140,17 @@ def main(config):
   print("mode: %s" % mode)
   if config.dataset == "cifar10":
     #MultiStepLR(lr/100.0, [150, 250], gamma=0.1)
-    if mode in ["DR", "EM", "SR"]:
-      opti = tf.keras.optimizers.Adam(learning_rate=1e-5, decay=weight_decay)
+    if mode == "DR":
+      opti = tf.keras.optimizers.Adam(learning_rate=1e-4, decay=weight_decay)
+    elif mode == "SR":
+      opti = tf.keras.optimizers.SGD(learning_rate=1e-4, decay=weight_decay,
+                                     momentum=momentum)
+    elif mode == "EM":
+      opti = tf.keras.optimizers.SGD(learning_rate=1e-2, momentum=momentum,
+                                     decay=weight_decay)
     elif mode in ["AVG", "MAX", "FC"]:
-      opti = tf.keras.optimizers.Adam(learning_rate=1e-3, decay=weight_decay)
-      #opti = tf.keras.optimizers.SGD(lr=1e-4, momentum=momentum,
-      #                               decay=weight_decay)
+      opti = tf.keras.optimizers.SGD(learning_rate=1e-4, momentum=momentum,
+                                     decay=weight_decay)
   elif config.dataset == "svhn_cropped":
     opti = tf.keras.optimizers.SGD(MultiStepLR(lr, [100, 150], gamma=0.1),
                                    momentum=momentum, decay=weight_decay)
@@ -157,29 +168,23 @@ def main(config):
       train(datum, model, opti, loss_func, train_avg_loss, train_avg_accu)
       loss = train_avg_loss.result()
       acc = train_avg_accu.result()
-      print('\rTraining the model: %d/%d Loss %.3f Acc %.3f' %
-            (idx, n_iterations_per_epoch, loss, acc), end="")
-    print("\nEpoch: %d Loss %.3f, Acc %.3f, %.3f secs "
+      print('\rEpoch: %d in training: %d/%d Loss %.3f Acc %.2f%%' %
+            (epoch + 1, idx, train_steps_per_epoch, loss, acc), end="")
+    print("\nEpoch: %d Train Loss %.3f, Acc %.2f%%, %.3f secs "
           "elapsed"%(epoch + 1, train_avg_loss.result(),
                      train_avg_accu.result(), (time.time() - start_time)))
 
     valid_avg_loss = tf.keras.metrics.Mean(name='valid_loss')
     valid_avg_accu = tf.keras.metrics.Mean(name='valid_acc')
-    # At the end of each epoch,
-    # measure the validation loss and accuracy:
-    for i, datum in enumerate(iter(ds_test)):
-      idx = i + 1
+    for datum in iter(ds_test):
       evaluation(datum, model, loss_func, valid_avg_loss, valid_avg_accu)
-      print("\rEvaluating the model: {}/{} ({:.1f}%)".format(idx, n_iterations_validation, idx * 100 / n_iterations_validation),
-        end=" " * 10)
-    print("\rEpoch: {}  Val accuracy: {:.4f}%  Loss: {:.6f}{}".format(
-      epoch + 1, valid_avg_accu.result(), valid_avg_loss.result(),
-      " (improved)" if valid_avg_loss.result() < best_valid_acc else ""))
+    print("Epoch: %d Valid Loss %.3f, Acc %.2f%%%s"%
+          (epoch + 1, valid_avg_loss.result(), valid_avg_accu.result(),
+      " (improved)" if valid_avg_loss.result() < best_valid_loss else ""))
 
-    if valid_avg_loss.result() < best_valid_acc:
-      best_valid_acc = valid_avg_loss.result()
+    if valid_avg_loss.result() < best_valid_loss:
+      best_valid_loss = valid_avg_loss.result()
 
-  print("Evaluation!")
   # Evaluation
   test_avg_loss = tf.keras.metrics.Mean(name='test_loss')
   test_avg_accu = tf.keras.metrics.Mean(name='test_acc')

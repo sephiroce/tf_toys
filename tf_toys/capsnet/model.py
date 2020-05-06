@@ -30,6 +30,7 @@ def create(name, conf, mode):
 
   raise NotImplementedError
 
+
 def padding(args):
   # padding to channel, I'll fix it
   x, planes = args
@@ -37,6 +38,7 @@ def padding(args):
                 [[0, 0], [0, 0], [0, 0], [planes // 4, planes // 4]],
                 "CONSTANT")
   return x
+
 
 class BasicBlock(tf.keras.layers.Layer):
   expansion = 1
@@ -81,15 +83,13 @@ class BasicBlock(tf.keras.layers.Layer):
     return out
 
 
-class ResNet(tf.keras.layers.Layer):
+class ResNet(tf.keras.Model):
   def __init__(self, config, cfg_data, block, num_blocks, mode):
     super(ResNet, self).__init__()
 
     _, classes = cfg_data['channels'], cfg_data['classes']
     self.num_caps = num_caps = config.num_caps
     self.caps_size = caps_size = config.caps_size
-    self.relu = tf.keras.layers.ReLU()
-    self.relu2 = tf.keras.layers.ReLU()
     self.mode = mode
     self.depth = depth = config.depth
     self.planes = planes = config.planes
@@ -118,13 +118,13 @@ class ResNet(tf.keras.layers.Layer):
           self.norm_layers.append(tf.keras.layers.BatchNormalization())
         elif self.mode == 'EM':
           self.conv_layers.append(
-            EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, strides=stride,
+            EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, stride=stride,
                         padding=1))
           self.norm_layers.append(tf.keras.layers.BatchNormalization())
         elif self.mode == 'SR':
           self.conv_layers.append(
             SelfRouting2d(num_caps, num_caps, caps_size, caps_size, kernel_size=3,
-                          strides=stride, padding=1, pose_out=True))
+                          stride=stride, padding=1, pose_out=True))
           self.norm_layers.append(tf.keras.layers.BatchNormalization())
 
     final_shape = 8 if depth == 1 else 4
@@ -185,7 +185,7 @@ class ResNet(tf.keras.layers.Layer):
     return layers
 
   def call(self, inputs, **kwargs):
-    out = self.relu(self.bn1(self.conv1(inputs)))
+    out = tf.nn.relu(self.bn1(self.conv1(inputs)))
     out = self.layer1(out)
     out = self.layer2(out)
     out = self.layer3(out)
@@ -235,18 +235,17 @@ class ResNet(tf.keras.layers.Layer):
       if self.mode in ['AVG', 'MAX']:
         out = self.pool(out)
       elif self.mode == 'FC':
-        out = self.relu2(self.bn_(self.conv_(out)))
+        out = tf.nn.relu(self.bn_(self.conv_(out)))
       out = tf.reshape(out, [tf.shape(out)[0], -1])
       out = self.fc(out)
 
     return out
 
+  """
   def forward_activations(self, x):
-    """
     What is this for?
     :param x:
     :return:
-    """
     out = tf.nn.relu(self.bn1(self.conv1(x)))
     out = self.layer1(out)
     out = self.layer2(out)
@@ -266,9 +265,10 @@ class ResNet(tf.keras.layers.Layer):
       raise NotImplementedError
 
     return a
+  """
 
 
-class ConvNet(tf.keras.layers.Layer):
+class ConvNet(tf.keras.Model):
   def __init__(self, conf, cfg_data, mode):
     super(ConvNet, self).__init__()
     _, classes = cfg_data["channels"], cfg_data["classes"]
@@ -312,14 +312,14 @@ class ConvNet(tf.keras.layers.Layer):
     self.backbone.add(tf.keras.layers.ReLU())
     self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
     self.backbone.add(tf.keras.layers.Conv2D(planes * 4, kernel_size=3,
-                                             strides=[1,1], use_bias=False
+                                             strides=1, use_bias=False
 
 ))
     self.backbone.add(tf.keras.layers.BatchNormalization())
     self.backbone.add(tf.keras.layers.ReLU())
     self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
     self.backbone.add(tf.keras.layers.Conv2D(planes * 8, kernel_size=3,
-                                             strides=[1,1], use_bias=False
+                                             strides=1, use_bias=False
 
 ))
     self.backbone.add(tf.keras.layers.BatchNormalization())
@@ -334,8 +334,7 @@ class ConvNet(tf.keras.layers.Layer):
       if self.mode == 'DR':
         self.conv_layers.append(
           DynamicRouting2d(num_caps, num_caps, caps_size, caps_size,
-                           kernel_size=3, stride=1, padding=1))
-        #nn.init.normal_(self.conv_layers[0].W, 0, 0.5)
+                           kernel_size=3, stride=1, padding=1, std_dev=0.5))
       elif self.mode == 'EM':
         self.conv_layers.append(
           EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, stride=1,
@@ -362,7 +361,8 @@ class ConvNet(tf.keras.layers.Layer):
       self.bn_pose = tf.keras.layers.BatchNormalization()
       if self.mode == 'DR':
         self.fc = DynamicRouting2d(num_caps, classes, caps_size, caps_size,
-                                   kernel_size=final_shape, padding=0)
+                                   kernel_size=final_shape, padding=0,
+                                   std_dev=0.1)
       elif self.mode in ['EM', 'SR']:
         self.conv_a = tf.keras.Sequential()
         self.conv_a.add(tf.keras.layers.ZeroPadding2D(padding=1))
@@ -444,7 +444,7 @@ class ConvNet(tf.keras.layers.Layer):
     return out
 
 
-class SmallNet(tf.keras.layers.Layer):
+class SmallNet(tf.keras.Model):
   def __init__(self, conf, cfg_data):
     super(SmallNet, self).__init__()
     # most of configuration is hard coded.
@@ -479,7 +479,7 @@ class SmallNet(tf.keras.layers.Layer):
       self.bn_pose = tf.keras.layers.BatchNormalization()
 
       self.conv_caps = SelfRouting2d(self.num_caps, self.num_caps, planes, planes,
-                                     kernel_size=3, strides=2, padding=1,
+                                     kernel_size=3, stride=2, padding=1,
                                      pose_out=True)
       self.bn_pose_conv_caps = tf.keras.layers.BatchNormalization()
 
@@ -494,12 +494,12 @@ class SmallNet(tf.keras.layers.Layer):
                                             use_bias=False))
 
       self.conv_caps = DynamicRouting2d(self.num_caps, self.num_caps, 16, 16,
-                                        kernel_size=3, strides=2, padding=1,
+                                        kernel_size=3, stride=2, padding=1,
                                         std_dev=0.5)
 
       self.fc_caps = DynamicRouting2d(self.num_caps, classes, 16, 16,
                                       kernel_size=last_size, padding=0,
-                                      stf_dev=0.05)
+                                      std_dev=0.05)
 
     elif self.mode == 'EM':
       self.conv_a = tf.keras.Sequential()
@@ -516,7 +516,7 @@ class SmallNet(tf.keras.layers.Layer):
       self.bn_pose = tf.keras.layers.BatchNormalization()
 
       self.conv_caps = EmRouting2d(self.num_caps, self.num_caps, 16, kernel_size=3,
-                                   strides=2, padding=1)
+                                   stride=2, padding=1)
       self.bn_pose_conv_caps = tf.keras.layers.BatchNormalization()
 
       self.fc_caps = EmRouting2d(self.num_caps, classes, 16, kernel_size=last_size,
