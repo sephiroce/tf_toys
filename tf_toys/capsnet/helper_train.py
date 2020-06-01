@@ -58,8 +58,8 @@ def unfold(tensor, kernel_size, dilation=1, padding=0, stride=1):
   # tensor: from [b, channel, width, height]
   #           to [b, width, height, channel]
   tensor = tf.transpose(tensor, [0, 2, 3, 1])
-  # tensor: from [b, channel, width, channel]
-  #           to [b, channel + padding * 2, width + padding * 2, channel]
+  # tensor: from [b, width, height, channel]
+  #           to [b, width + padding * 2, height + padding * 2, channel]
   if padding > 0:
     tensor = tf.keras.layers.ZeroPadding2D(padding=padding)(tensor)
   # this implementation is tf.image.extract_patches

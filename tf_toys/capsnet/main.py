@@ -143,11 +143,11 @@ def main(config):
     if mode == "DR":
       opti = tf.keras.optimizers.Adam(learning_rate=1e-4, decay=weight_decay)
     elif mode == "SR":
-      opti = tf.keras.optimizers.SGD(learning_rate=1e-4, decay=weight_decay,
-                                     momentum=momentum)
+      opti = tf.keras.optimizers.Adam(learning_rate=1e-5, decay=weight_decay)
     elif mode == "EM":
-      opti = tf.keras.optimizers.SGD(learning_rate=1e-2, momentum=momentum,
-                                     decay=weight_decay)
+      #opti = tf.keras.optimizers.SGD(learning_rate=1e-4, momentum=momentum,
+      #                               decay=weight_decay)
+      opti = tf.keras.optimizers.Adam(learning_rate=1e-5, decay=weight_decay)
     elif mode in ["AVG", "MAX", "FC"]:
       opti = tf.keras.optimizers.SGD(learning_rate=1e-4, momentum=momentum,
                                      decay=weight_decay)

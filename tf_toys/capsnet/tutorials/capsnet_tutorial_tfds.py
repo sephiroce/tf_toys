@@ -79,7 +79,7 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     caps1_output_tiled = tf.tile(caps1_output_tile, [1, 1, caps2_n, 1, 1])
     u_hat = tf.matmul(W_tiled, caps1_output_tiled)
 
-
+    tf.print("\nu_hat:",tf.shape(u_hat))
     # ==========================================================================
     # Dynamic Routing
     # ==========================================================================
@@ -104,7 +104,7 @@ class CapsuleNetwork(tf.keras.layers.Layer):
     # Round2, Line 6
     caps2_output = squash(weighted_sum_round_2, axis=-2)
     # ==========================================================================
-    #tf.print(tf.shape(caps2_output))
+    tf.print(tf.shape(caps2_output))
 
     y_proba = length(caps2_output, axis=-2)
     y_proba_argmax = tf.argmax(y_proba, axis=2)

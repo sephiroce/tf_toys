@@ -210,7 +210,7 @@ class ResNet(tf.keras.Model):
       out = out / tf.reduce_sum(out, keepdims=True)
       out = tf.math.log(out)
 
-    # Routing
+    # Other routings
     elif self.mode in ['EM', 'SR']:
       a, pose = self.conv_a(out), self.conv_pose(out)
       a, pose = tf.nn.sigmoid(self.bn_a(a)), self.bn_pose(pose)

@@ -109,7 +109,6 @@ class EmRouting2d(tf.keras.layers.Layer):
 
     self.stride = stride
     self.pad = padding
-
     self.iters = iters
 
     init=tf.keras.initializers.he_uniform(seed=None)
@@ -120,7 +119,6 @@ class EmRouting2d(tf.keras.layers.Layer):
 
     self.final_lambda = final_lambda
     self.ln_2pi = tf.math.log(2 * math.pi)
-
     self.lambda_ = None
 
   def m_step(self, v, a_in, r):
@@ -165,7 +163,7 @@ class EmRouting2d(tf.keras.layers.Layer):
     sigma_sq = tf.expand_dims(sigma_sq, 2)
 
     ln_p_j = -0.5 * tf.reduce_sum(tf.math.log(sigma_sq*self.ln_2pi), axis=-1) \
-             - tf.reduce_sum((v-mu)**2 / (2 * sigma_sq), axis=-1)
+             - tf.reduce_sum((v - mu)**2 / (2 * sigma_sq), axis=-1)
 
     # [b, l, kkA, B]
     ln_ap = ln_p_j + tf.math.log(tf.reshape(a_out, (b, l, 1, self.B)))
@@ -173,41 +171,6 @@ class EmRouting2d(tf.keras.layers.Layer):
     r = tf.nn.softmax(ln_ap, axis=-1)
     # [b, l, kkA, B, 1]
     return tf.expand_dims(r, -1)
-
-  def em_iteration(self, v, a_in, r):
-    """
-    Iteration range is from 1 to 4.
-
-    # the below line is from open review
-    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
-    :param v:
-    :param a_in:
-    :param r:
-    :return:
-    """
-    if self.iters < 0 or self.iters > 3:
-      return None, None
-
-    i = 0
-    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
-    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
-    if self.iters == 1:
-      return a_out, pose_out
-
-    i = 1
-    r = self.e_step(v, a_out, pose_out, sigma_sq)
-    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
-    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
-    if self.iters == 2:
-      return a_out, pose_out
-
-    i = 2
-    r = self.e_step(v, a_out, pose_out, sigma_sq)
-    self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
-    a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
-    if self.iters == 3:
-      return a_out, pose_out
-
 
   def call(self, inputs, **kwargs):
     a_in, pose = inputs
@@ -245,9 +208,13 @@ class EmRouting2d(tf.keras.layers.Layer):
     a_in = tf.reshape(a_in, (b, l, self.kkA))
 
     r = tf.ones((b, l, self.kkA, self.B, 1), dtype=a_in.dtype)
-
-    # I will fix it
-    a_out, pose_out = self.em_iteration(v, a_in, r)
+    a_out = None
+    for i in range(self.iters):
+      # this is from open review
+      self.lambda_ = self.final_lambda * (1 - 0.95 ** (i + 1))
+      a_out, pose_out, sigma_sq = self.m_step(v, a_in, r)
+      if i < self.iters - 1:
+        r = self.e_step(v, a_out, pose_out, sigma_sq)
 
     # [b, l, B*psize]
     pose_out = tf.reshape(tf.expand_dims(pose_out, 2), (b, l, -1))
@@ -293,6 +260,10 @@ class SelfRouting2d(tf.keras.layers.Layer):
     # a: [b, A, h, w]
     # pose: [b, AC, h, w]
     a, pose = inputs
+
+    #tf.print("len a : ", tf.shape(a)[-1])
+    #tf.print("len pose : ", tf.shape(pose)[-1])
+
     b, h, w = tf.shape(a)[0], tf.shape(a)[2], tf.shape(a)[3]
     pose_out = None
 
@@ -353,6 +324,7 @@ class SelfRouting2d(tf.keras.layers.Layer):
     oh = ow = tf.cast(tf.floor(l ** (1.0 / 2)), tf.int32)
 
     a_out = tf.reshape(a_out, (b, -1, oh, ow))
+
     if hasattr(self, 'W1'):
       pose_out = tf.reshape(pose_out, (b, -1, oh, ow))
 
