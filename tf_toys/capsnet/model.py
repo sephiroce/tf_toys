@@ -1,264 +1,567 @@
-#-*- coding:utf-8 -*-
-"""model.py: the simplest example for the capsule network"""
-# from https://github.com/ageron/handson-ml/blob/master/extra_capsnets.ipynb
+from tf_toys.capsnet.routing import DynamicRouting2d, EmRouting2d, SelfRouting2d
+from tf_toys.capsnet.helper_train import squash, length
 import tensorflow as tf
-import tensorflow_datasets as tfds
+
+DATASET_CONFIGS = {
+    'cifar10': {'size': 32, 'channels': 3, 'classes': 10},
+    'svhn_cropped': {'size': 32, 'channels': 3, 'classes': 10},
+    'smallnorb': {'size': 32, 'channels': 1, 'classes': 5},
+}
+
+def create(name, conf, mode):
+  name = name.lower()
+  if name.startswith("resnet"):
+    return ResNet(conf, DATASET_CONFIGS[conf.dataset], BasicBlock, [3, 3, 3],
+                  mode)
+  """
+  if name.startwith("resnet32"):
+    return ResNet(conf, BasicBlock, [5, 5, 5])
+  if name.startwith("resnet44"):
+    return ResNet(conf, BasicBlock, [7, 7, 7])
+  if name.startwith("resnet56"):
+    return ResNet(conf, BasicBlock, [9, 9, 9])
+  if name.startwith("resnet110"):
+    return ResNet(conf, BasicBlock, [18, 18, 18])
+  """
+  if name.startswith("convnet"):
+    return ConvNet(conf, DATASET_CONFIGS[conf.dataset], mode)
+  if name.startswith("small"):
+    return SmallNet(conf, DATASET_CONFIGS[conf.dataset])
+
+  raise NotImplementedError
 
 
-caps1_n_maps = 32
-caps1_n_dims = 8
-caps1_n_caps = caps1_n_maps * 6 * 6
-caps2_n_caps = 10
-caps2_n_dims = 16
-
-m_plus = 0.9
-m_minus = 0.1
-lambda_ = 0.5
+def padding(args):
+  # padding to channel, I'll fix it
+  x, planes = args
+  x = tf.pad(x[:, ::2, ::2, :],
+                [[0, 0], [0, 0], [0, 0], [planes // 4, planes // 4]],
+                "CONSTANT")
+  return x
 
 
-class ConvolutionalLayers(tf.keras.layers.Layer):
-  def __init__(self):
-    super(ConvolutionalLayers, self).__init__()
-    self.cnn1 = None
-    self.cnn2 = None
-    self.reshape = None
+class BasicBlock(tf.keras.layers.Layer):
+  expansion = 1
+  def __init__(self, in_planes, planes, stride=1, option='A'):
+    super(BasicBlock, self).__init__()
+    self.conv1 = tf.keras.Sequential()
+    self.conv1.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.conv1.add(tf.keras.layers.Conv2D(planes, kernel_size=3, strides=stride,
+                                          use_bias=False))
+    self.bn1 = tf.keras.layers.BatchNormalization()
+    self.conv2 = tf.keras.Sequential()
+    self.conv2.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.conv2.add(tf.keras.layers.Conv2D(planes, kernel_size=3, strides=1,
+                                          use_bias=False))
+    self.bn2 = tf.keras.layers.BatchNormalization()
 
-  def build(self, input_shape):
-    self.cnn1 = tf.keras.layers.Conv2D(input_shape=input_shape,
-                                      filters=256, kernel_size=[9, 9],
-                                       strides=[1, 1],
-                                      padding="valid",
-                                      activation="relu")
-    # [batch, pc width, pc height, n_maps * n_dims]
-    self.cnn2 = tf.keras.layers.Conv2D(filters=caps1_n_maps * caps1_n_dims,
-                                       kernel_size=[9, 9],
-                                      strides=[2, 2],
-                                      padding="valid",
-                                      activation="relu")
-    # [batch, pc width * pc height * n_maps, n_dims]
-    self.reshape = tf.keras.layers.Reshape([caps1_n_caps, caps1_n_dims])
+    self.shortcut = tf.keras.Sequential() # bypass
+    self.planes = None
+    if stride != 1 or in_planes != planes:
+      if option == 'A':
+        """
+        For CIFAR10 ResNet paper uses option A.
+        """
+        self.shortcut = tf.keras.layers.Lambda(padding)
+        self.planes = planes
+      elif option == 'B':
+        self.shortcut = tf.keras.Sequential()
+        self.shortcut.add(tf.keras.layers.Conv2D(self.expansion * planes,
+                                                 kernel_size=1,
+                                                 strides=stride,
+                                                 use_bias=False))
+        self.shortcut.add(tf.keras.layers.BatchNormalization())
 
   def call(self, inputs, **kwargs):
-    pc = self.cnn2(self.cnn1(inputs))
-    return self.reshape(pc)
+    out = tf.nn.relu(self.bn1(self.conv1(inputs)))
+    out = self.bn2(self.conv2(out))
+    if self.planes is not None: # it means option == 'A'
+      out += self.shortcut((inputs, self.planes))
+    else:
+      out += self.shortcut(inputs)
+    out = tf.nn.relu(out)
+    return out
 
-class DecoderLayers(tf.keras.layers.Layer):
-  def __init__(self):
-    super(DecoderLayers, self).__init__()
-    self.hidden1 = None
-    self.hidden2 = None
-    self.decoder_output = None
 
-  def build(self, input_shape):
-    n_hidden1 = 512
-    n_hidden2 = 1024
-    n_output = 28 * 28
-    self.hidden1 = tf.keras.layers.Dense(n_hidden1,
-                                    activation="relu",
-                                    name="hidden1")
-    self.hidden2 = tf.keras.layers.Dense(n_hidden2,
-                                    activation="relu",
-                                    name="hidden2")
-    self.decoder_output = tf.keras.layers.Dense(n_output,
-                                           activation="sigmoid",
-                                           name="decoder_output")
+class ResNet(tf.keras.Model):
+  def __init__(self, config, cfg_data, block, num_blocks, mode):
+    super(ResNet, self).__init__()
+
+    _, classes = cfg_data['channels'], cfg_data['classes']
+    self.num_caps = num_caps = config.num_caps
+    self.caps_size = caps_size = config.caps_size
+    self.mode = mode
+    self.depth = depth = config.depth
+    self.planes = planes = config.planes
+    self.in_planes = planes  # always same?
+
+    self.conv1 = tf.keras.Sequential()
+    self.conv1.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.conv1.add(tf.keras.layers.Conv2D(planes, kernel_size=3, strides=1,
+                                          use_bias=False))
+    self.bn1 = tf.keras.layers.BatchNormalization()
+    self.layer1 = self._make_layer(block, planes, num_blocks[0], strides=1)
+    self.layer2 = self._make_layer(block, 2 * planes, num_blocks[1], strides=2)
+    self.layer3 = self._make_layer(block, 4 * planes, num_blocks[2], strides=2)
+
+    self.conv_layers = []
+    self.norm_layers = []
+
+    stride = 1
+    if self.mode in ['DR', 'EM', 'SR']:
+      for d in range(1, depth):
+        stride = 2 if d == 1 else 1
+        if self.mode == 'DR':
+          self.conv_layers.append(
+            DynamicRouting2d(num_caps, num_caps, caps_size, caps_size, kernel_size=3,
+                             stride=stride, padding=1))
+          self.norm_layers.append(tf.keras.layers.BatchNormalization())
+        elif self.mode == 'EM':
+          self.conv_layers.append(
+            EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, stride=stride,
+                        padding=1))
+          self.norm_layers.append(tf.keras.layers.BatchNormalization())
+        elif self.mode == 'SR':
+          self.conv_layers.append(
+            SelfRouting2d(num_caps, num_caps, caps_size, caps_size, kernel_size=3,
+                          stride=stride, padding=1, pose_out=True))
+          self.norm_layers.append(tf.keras.layers.BatchNormalization())
+
+    final_shape = 8 if depth == 1 else 4
+
+    # Routings: ConvCaps to Class Capsules
+    if self.mode in ['DR', 'EM', 'SR']:
+      self.conv_pose = tf.keras.Sequential()
+      self.conv_pose.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_pose.add(tf.keras.layers.Conv2D(num_caps * caps_size,
+                                                kernel_size=3, strides=1,
+                                                use_bias=False))
+      self.bn_pose = tf.keras.layers.BatchNormalization()
+      if self.mode == 'DR':
+        self.fc = DynamicRouting2d(num_caps, classes, caps_size, caps_size,
+                                   kernel_size=final_shape, padding=0)
+      elif self.mode in ['EM', 'SR']:
+        self.conv_a = tf.keras.Sequential()
+        self.conv_a.add(tf.keras.layers.ZeroPadding2D(padding=1))
+        self.conv_a.add(tf.keras.layers.Conv2D(num_caps, kernel_size=3,
+                                               strides=1, use_bias=False))
+        self.bn_a = tf.keras.layers.BatchNormalization()
+
+        if self.mode == 'EM':
+          self.fc = EmRouting2d(num_caps, classes, caps_size,
+                                kernel_size=final_shape, padding=0)
+        else:
+          self.fc = SelfRouting2d(num_caps, classes, caps_size, 1,
+                                  kernel_size=final_shape, padding=0,
+                                  pose_out=False)
+    else:
+      # avg pooling
+      if self.mode == 'AVG':
+        self.pool = tf.keras.layers.AveragePooling2D(final_shape)
+        self.fc = tf.keras.layers.Dense(classes)
+
+      # max pooling
+      if self.mode == 'MAX':
+        self.pool = tf.keras.layers.MaxPool2D(final_shape)
+        self.fc = tf.keras.layers.Dense(classes)
+
+      # What is this?
+      if self.mode == 'FC':
+        self.conv_ = tf.keras.Sequential()
+        self.conv_.add(tf.keras.layers.ZeroPadding2D(padding=1))
+        self.conv_.add(tf.keras.layers.Conv2D(num_caps * caps_size,
+                                              kernel_size=3, strides=stride,
+                                              use_bias=True))
+        self.bn_ = tf.keras.layers.BatchNormalization()
+        self.fc = tf.keras.layers.Dense(classes)
+
+  def _make_layer(self, block, planes, num_blocks, strides):
+    strides = [strides] + [1] * (num_blocks - 1)
+    layers = tf.keras.Sequential()
+    for stride in strides:
+      layers.add(block(self.in_planes, planes, stride))
+      self.in_planes = planes * block.expansion
+
+    return layers
 
   def call(self, inputs, **kwargs):
-    return self.decoder_output(self.hidden2(self.hidden1(inputs)))
+    out = tf.nn.relu(self.bn1(self.conv1(inputs)))
+    out = self.layer1(out)
+    out = self.layer2(out)
+    out = self.layer3(out)
 
-def squash(s, axis=-1, epsilon=1e-7, name=None):
-  with tf.name_scope(name):
-    # for better numerical stability
-    squared_norm = tf.math.reduce_sum(tf.square(s), axis=axis, keepdims=True)
-    safe_norm = tf.sqrt(squared_norm + epsilon)
-    squash_factor = squared_norm / (1. + squared_norm)
-    unit_vector = s / safe_norm
-    return squash_factor * unit_vector
+    # DR
+    if self.mode == 'DR':
+      pose = self.bn_pose(self.conv_pose(out))
+      b, w, h, c = tf.shape(pose)[0], tf.shape(pose)[1], tf.shape(pose)[2], \
+                   tf.shape(pose)[3]
 
-def safe_norm(s, axis=-1, epsilon=1e-7, keep_dims=False, name=None):
-  with tf.name_scope(name):
-    squared_norm = tf.reduce_sum(tf.square(s), axis=axis,
-                                 keepdims=keep_dims)
-    return tf.sqrt(squared_norm + epsilon)
+      pose = squash(tf.reshape(pose, (b, w, h, self.num_caps, self.caps_size)))
+      pose = tf.reshape(pose, [b, w, h, c])
+      # [b, h, w, c]
+      pose = tf.transpose(pose, [0, 3, 2, 1])
 
-def main():
-  #pylint: disable=too-many-locals
-  print(tf.__version__)
-  mnist_builder = tfds.builder("mnist")
-  mnist_builder.download_and_prepare()
-  ds_train = mnist_builder.as_dataset(split="train")
-  ds_test = mnist_builder.as_dataset(split="test")
+      # routing methods
+      for m in self.conv_layers:
+        pose = m(pose)
+      out = tf.squeeze(self.fc(pose))
+      out = tf.reshape(out, [b, -1, self.caps_size])
+      out = length(out, axis=-1)
+      out = out / tf.reduce_sum(out, keepdims=True)
+      out = tf.math.log(out)
 
-  ds_train = ds_train.repeat(1).shuffle(1024).batch(32)
-  ds_train = ds_train.prefetch(tf.data.experimental.AUTOTUNE)
+    # Other routings
+    elif self.mode in ['EM', 'SR']:
+      a, pose = self.conv_a(out), self.conv_pose(out)
+      a, pose = tf.nn.sigmoid(self.bn_a(a)), self.bn_pose(pose)
 
-  ds_test = ds_test.repeat(1).batch(32)
-  ds_test = ds_test.prefetch(tf.data.experimental.AUTOTUNE)
+      # [b, h, w, c]
+      a = tf.transpose(a, [0, 3, 2, 1])
+      pose = tf.transpose(pose, [0, 3, 2, 1])
+      for m, bn in zip(self.conv_layers, self.norm_layers):
+        a, pose = m((a, pose))
+        pose = bn(pose)
 
-  cnn_model = ConvolutionalLayers()
-  dec_model = DecoderLayers()
-  optimizer = tf.keras.optimizers.Adam()
-  cnn_model.build(input_shape=[-1, 28, 28, 1])
+      a, _ = self.fc((a, pose)) # we don't use pose anymore, it only for routing
+      out = tf.reshape(a, [tf.shape(a)[0], -1])
 
-  loss_object = \
-    tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+      if self.mode == 'EM':
+        out = out / tf.reduce_sum(out, keepdims=True)
 
-  @tf.function
-  def train(inputs, loss_state, acc_state):
-    input_image = tf.cast(inputs["image"], tf.float32)
-    input_label = tf.cast(inputs["label"], tf.float32)
-    batch_size = tf.shape(input_image)[0]
+      out = tf.math.log(out)
 
-    with tf.GradientTape() as tape:
-      caps1_raw = cnn_model(input_image)
-      #tf.print("caps1_raw:", tf.shape(caps1_raw))
-      # this is u
-      caps1_output = squash(caps1_raw, name="caps1_output")
-      #tf.print("caps1_output:", tf.shape(caps1_output))
+    # No Routing
+    else:
+      if self.mode in ['AVG', 'MAX']:
+        out = self.pool(out)
+      elif self.mode == 'FC':
+        out = tf.nn.relu(self.bn_(self.conv_(out)))
+      out = tf.reshape(out, [tf.shape(out)[0], -1])
+      out = self.fc(out)
 
-      init_sigma = 0.1
-      W = tf.random.normal([1, caps1_n_caps, caps2_n_caps, caps2_n_dims,
-                                 caps1_n_dims],stddev=init_sigma,name="W_init")
-      W_tiled = tf.tile(W, [batch_size, 1,1,1,1], name="W_tiled")
+    return out
 
-      caps1_output_expanded = tf.expand_dims(caps1_output, -1,
-                                             name="caps1_output_expanded")
-      caps1_output_tile = tf.expand_dims(caps1_output_expanded, 2,
-                                         name="caps1_output_tile")
-      caps1_output_tiled = tf.tile(caps1_output_tile,
-                                   [1, 1, caps2_n_caps, 1, 1],
-                                   name="caps1_output_tiled")
-      caps2_predicted = tf.matmul(W_tiled, caps1_output_tiled,
-                                  name="caps2_predicted")
+  """
+  def forward_activations(self, x):
+    What is this for?
+    :param x:
+    :return:
+    out = tf.nn.relu(self.bn1(self.conv1(x)))
+    out = self.layer1(out)
+    out = self.layer2(out)
+    out = self.layer3(out)
 
-      #tf.print("W_tiled:", tf.shape(W_tiled))
-      #tf.print("caps1_output_tiled:", tf.shape(caps1_output_tiled))
+    if self.mode == 'DR':
+      pose = self.bn_pose(self.conv_pose(out))
+      b, c, h, w = tf.shape(pose)
+      pose = tf.transpose(pose, [0, 2, 3, 1])
+      pose = squash(tf.reshape(pose(b, h, w, self.num_caps, self.caps_size)))
+      pose = tf.reshape(pose, [b, h, w, -1])
+      pose = tf.transpose(pose, [0, 3, 1, 2])
+      a = length(pose, axis=1)
+    elif self.mode in ['EM', 'SR']:
+      a = tf.nn.sigmoid(self.bn_a(self.conv_a(out)))
+    else:
+      raise NotImplementedError
 
-      # this is b, weight between 1, 2, Initializing before the loop
-      raw_weights = tf.zeros([batch_size, caps1_n_caps, caps2_n_caps, 1, 1],
-                             dtype=tf.float32, name="raw_weights")
-
-      # Loop Start!, Round1
-      routing_weights = tf.nn.softmax(raw_weights, axis=2,
-                                      name="routing_weights")
-      weighted_predictions = tf.multiply(routing_weights, caps2_predicted,
-                                         name="weighted_predictions")
-      weighted_sum = tf.reduce_sum(weighted_predictions, axis=1, keepdims=True,
-                                   name="weighted_sum")
-      caps2_output_round_1 = squash(weighted_sum, axis=-2,
-                                    name="caps2_output_round_1")
-
-      # Round2
-      caps2_output_round_1_tiled = tf.tile(
-        caps2_output_round_1, [1, caps1_n_caps, 1, 1, 1],
-        name="caps2_output_round_1_tiled")
-      agreement = tf.matmul(caps2_predicted, caps2_output_round_1_tiled,
-                            transpose_a=True, name="agreement")
-      raw_weights_round_2 = tf.add(raw_weights, agreement,
-                                   name="raw_weights_round_2")
-
-      # just like round 1
-      routing_weights_round_2 = tf.nn.softmax(raw_weights_round_2,
-                                              axis=2,
-                                              name="routing_weights_round_2")
-      weighted_predictions_round_2 = tf.multiply(routing_weights_round_2,
-                                                 caps2_predicted,
-                                                 name="weighted_predictions_round_2")
-      weighted_sum_round_2 = tf.reduce_sum(weighted_predictions_round_2,
-                                           axis=1, keepdims=True,
-                                           name="weighted_sum_round_2")
-      caps2_output_round_2 = squash(weighted_sum_round_2,
-                                    axis=-2,
-                                    name="caps2_output_round_2")
-
-      with tf.name_scope("margin_loss"):
-        T = tf.one_hot(tf.cast(input_label, tf.int32), depth=caps2_n_caps,
-                               name="T")
-        caps2_output_norm = safe_norm(caps2_output_round_2, axis=-2, keep_dims=True,
-                                      name="caps2_output_norm")
-
-        present_error_raw = tf.square(tf.maximum(0., m_plus - caps2_output_norm),
-                                      name="present_error_raw")
-        present_error = tf.reshape(present_error_raw, shape=(-1, 10),
-                                   name="present_error")
-
-        absent_error_raw = tf.square(tf.maximum(0., caps2_output_norm - m_minus),
-                                     name="absent_error_raw")
-        absent_error = tf.reshape(absent_error_raw, shape=(-1, 10),
-                                  name="absent_error")
-
-        L = tf.add(T * present_error, lambda_ * (1.0 - T) * absent_error,
-                   name="L")
-        margin_loss = tf.reduce_mean(tf.reduce_sum(L, axis=1), name="margin_loss")
-
-      with tf.name_scope("reconstruction_loss"):
-        # To see prediction
-        y_proba = safe_norm(caps2_output_round_2, axis=-2, name="y_proba")
-        y_proba_argmax = tf.argmax(y_proba, axis=2, name="y_proba")
-        y_pred = tf.squeeze(y_proba_argmax, axis=[1, 2], name="y_pred")
-
-        reconstruction_targets = tf.cast(input_label, tf.int32)
-        """
-        reconstruction_targets = tf.cond(True,  # condition
-                                         lambda: input_label,  # if True
-                                         lambda: y_pred,  # if False
-                                         name="reconstruction_targets")
-        """
-        reconstruction_mask = tf.one_hot(reconstruction_targets,
-                                         depth=caps2_n_caps,
-                                         name="reconstruction_mask")
-        reconstruction_mask_reshaped = tf.reshape(
-          reconstruction_mask, [-1, 1, caps2_n_caps, 1, 1],
-          name="reconstruction_mask_reshaped")
-        caps2_output_masked = tf.multiply(
-          caps2_output_round_2, reconstruction_mask_reshaped,
-          name="caps2_output_masked")
-
-        decoder_input = tf.reshape(caps2_output_masked,
-                                   [-1, caps2_n_caps * caps2_n_dims],
-                                   name="decoder_input")
-
-        decoder_output = dec_model(decoder_input)
-
-        X_flat = tf.reshape(input_image, [-1, 28 * 28], name="X_flat")
-        squared_difference = tf.square(X_flat - decoder_output,
-                                       name="squared_difference")
-        reconstruction_loss = tf.reduce_mean(squared_difference,
-                                             name="reconstruction_loss")
-
-      alpha = 0.0005
-
-      loss = tf.add(margin_loss, alpha * reconstruction_loss, name="loss")
-      grads = tape.gradient(loss, cnn_model.trainable_variables)
-      optimizer.apply_gradients(zip(grads, cnn_model.trainable_variables))
-
-    loss_state.update_state(loss)
-    correct = tf.equal(tf.cast(input_label, tf.float32),
-                       tf.cast(y_pred, tf.float32), name="correct")
-    accuracy = tf.reduce_mean(tf.cast(correct, tf.float32), name="accuracy")
-    acc_state.update_state(accuracy)
+    return a
+  """
 
 
-  for epoch in range(1, 10):
-    epoch_loss_avg = tf.keras.metrics.Mean()
-    epoch_accuracy = tf.keras.metrics.Mean()
-    for datum in iter(ds_train):
-      train(datum, epoch_loss_avg, epoch_accuracy)
-    print("Epoch %d loss %.3f, accuracy %.3f"%(epoch, epoch_loss_avg.result(),
-                                               epoch_accuracy.result()))
+class ConvNet(tf.keras.Model):
+  def __init__(self, conf, cfg_data, mode):
+    super(ConvNet, self).__init__()
+    _, classes = cfg_data["channels"], cfg_data["classes"]
+    self.num_caps = num_caps = conf.num_caps
+    self.caps_size = caps_size = conf.caps_size #16
+    self.depth = depth = conf.depth
+    self.mode = mode
+    assert self.mode in ['DR', 'EM', 'SR', 'AVG', 'MAX', 'FC']
+    planes = conf.planes
 
-  loss_state = tf.keras.metrics.Mean()
-  acc_state = tf.keras.metrics.SparseCategoricalAccuracy()
-  for inputs in iter(ds_test):
-    input_image = tf.cast(inputs["image"], tf.float32)
-    input_label = tf.cast(inputs["label"], tf.float32)
-    y_pred = cnn_model(input_image)
-    loss = loss_object(input_label, y_pred)
-    loss_state.update_state(loss)
-    acc_state.update_state(input_label, y_pred)
-  print("Test loss %.3f, accuracy %.3f" % (loss_state.result(),
-                                           acc_state.result()))
+    self.backbone = tf.keras.Sequential()
+    self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    if self.mode == 'DR':
+      self.backbone.add(tf.keras.layers.Conv2D(planes, kernel_size=3,
+                                               strides=1, use_bias=False,
+                                               kernel_initializer=tf.keras.initializers.random_normal(mean=0.0, stddev=0.5)))
+    else:
+      self.backbone.add(tf.keras.layers.Conv2D(planes, kernel_size=3,
+                                               strides=1, use_bias=False))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+    self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.backbone.add(tf.keras.layers.Conv2D(planes * 2, kernel_size=3,
+                                             strides=1, use_bias=False
+
+))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+    self.backbone.add(tf.keras.layers.Conv2D(planes * 2, kernel_size=3,
+                                             strides=1, use_bias=False
+
+))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+    self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.backbone.add(tf.keras.layers.Conv2D(planes * 4, kernel_size=3,
+                                             strides=1, use_bias=False
+
+))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+    self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.backbone.add(tf.keras.layers.Conv2D(planes * 4, kernel_size=3,
+                                             strides=1, use_bias=False
+
+))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+    self.backbone.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.backbone.add(tf.keras.layers.Conv2D(planes * 8, kernel_size=3,
+                                             strides=1, use_bias=False
+
+))
+    self.backbone.add(tf.keras.layers.BatchNormalization())
+    self.backbone.add(tf.keras.layers.ReLU())
+
+    self.conv_layers = []
+    self.norm_layers = []
+
+    ####
+    # ConvCaps Layers
+    for d in range(1, depth):
+      if self.mode == 'DR':
+        self.conv_layers.append(
+          DynamicRouting2d(num_caps, num_caps, caps_size, caps_size,
+                           kernel_size=3, stride=1, padding=1, std_dev=0.5))
+      elif self.mode == 'EM':
+        self.conv_layers.append(
+          EmRouting2d(num_caps, num_caps, caps_size, kernel_size=3, stride=1,
+                      padding=1))
+        self.norm_layers.append(tf.keras.layers.BatchNormalization())
+      elif self.mode == 'SR':
+        self.conv_layers.append(
+          SelfRouting2d(num_caps, num_caps, caps_size, caps_size, kernel_size=3,
+                        stride=1, padding=1, pose_out=True))
+        self.norm_layers.append(tf.keras.layers.BatchNormalization())
+      else:
+        break
+
+    final_shape = 4
+
+    ####
+    # Routings: ConvCaps to Class Capsules
+    if self.mode in ['DR', 'EM', 'SR']:
+      self.conv_pose = tf.keras.Sequential()
+      self.conv_pose.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_pose.add(tf.keras.layers.Conv2D(num_caps * caps_size,
+                                                kernel_size=3,
+                                                strides=1, use_bias=False))
+      self.bn_pose = tf.keras.layers.BatchNormalization()
+      if self.mode == 'DR':
+        self.fc = DynamicRouting2d(num_caps, classes, caps_size, caps_size,
+                                   kernel_size=final_shape, padding=0,
+                                   std_dev=0.1)
+      elif self.mode in ['EM', 'SR']:
+        self.conv_a = tf.keras.Sequential()
+        self.conv_a.add(tf.keras.layers.ZeroPadding2D(padding=1))
+        self.conv_a.add(tf.keras.layers.Conv2D(num_caps, kernel_size=3,
+                                               strides=1, use_bias=False))
+        self.bn_a = tf.keras.layers.BatchNormalization()
+
+        if self.mode == 'EM':
+          self.fc = EmRouting2d(num_caps, classes, caps_size,
+                                kernel_size=final_shape, padding=0)
+        else:
+          self.fc = SelfRouting2d(num_caps, classes, caps_size, 1,
+                                  kernel_size=final_shape, padding=0,
+                                  pose_out=False)
+    else:
+      self.fc = tf.keras.layers.Dense(classes)
+      # avg pooling
+      if self.mode == 'AVG':
+        self.pool = tf.keras.layers.AveragePooling2D(final_shape)
+
+      # max pooling
+      if self.mode == 'MAX':
+        self.pool = tf.keras.layers.MaxPool2D(final_shape)
+
+      # What is this?
+      if self.mode == 'FC':
+        self.conv_ = tf.keras.Sequential()
+        self.conv_.add(tf.keras.layers.ZeroPadding2D(padding=(1,1)))
+        self.conv_.add(tf.keras.layers.Conv2D(num_caps * caps_size,
+                                              kernel_size=3, strides=1,
+                                              use_bias=False))
+        self.bn_ = tf.keras.layers.BatchNormalization()
+
+  def call(self, inputs, **kwargs):
+    # backbone
+    out = self.backbone(inputs)
+
+    # DR
+    if self.mode == 'DR':
+      pose = self.bn_pose(self.conv_pose(out))
+
+      b, c, h, w = tf.shape(pose)
+      pose = tf.transpose(pose, [0, 2, 3, 1])
+      pose = squash(tf.reshape(pose(b, h, w, self.num_caps, self.caps_size)))
+      pose = tf.reshape(pose, [b, h, w, -1])
+      pose = tf.transpose(pose, [0, 3, 1, 2])
+
+      for m in self.conv_layers:
+        pose = m(pose)
+
+      out = self.fc(pose)
+      out = tf.reshape(out, [b, -1, self.caps_size])
+      out = length(out, axis=-1)
+
+    # Routing
+    elif self.mode in ['EM', 'SR']:
+      a, pose = self.conv_a(out), self.conv_pose(out)
+      a, pose = tf.nn.sigmoid(self.bn_a(a)), self.bn_pose(pose)
+
+      for m, bn in zip(self.conv_layers, self.norm_layers):
+        a, pose = m(a, pose)
+        pose = bn(pose)
+
+      a, _ = self.fc(a, pose) # we don't use pose anymore, it only for routing?
+      out = tf.reshape(a, [tf.shape(a)[0], -1])
+
+      if self.mode == 'SR':
+        out = tf.math.log(out)
+
+    # No Routing
+    else:
+      if self.mode in ['AVG', 'MAX']:
+        out = self.pool(out)
+      elif self.mode == 'FC':
+        out = tf.nn.relu(self.bn_(self.conv_(out)))
+      out = tf.reshape(out, [tf.shape(out)[0], -1])
+      out = self.fc(out)
+
+    return out
 
 
-if __name__ == "__main__":
-  main()
+class SmallNet(tf.keras.Model):
+  def __init__(self, conf, cfg_data):
+    super(SmallNet, self).__init__()
+    # most of configuration is hard coded.
+    _, classes = cfg_data["channels"], cfg_data["classes"]
+    self.conv1 = tf.keras.Sequential()
+    self.conv1.add(tf.keras.layers.ZeroPadding2D(padding=1))
+    self.conv1.add(tf.keras.layers.Conv2D(256,
+                                          kernel_size=[7, 7], strides=[2, 2],
+                                          use_bias=False))
+    self.bn1 = tf.keras.layers.BatchNormalization()
+
+    self.mode = conf["mode"]
+    assert self.mode in ['DR', 'EM', 'SR', 'AVG', 'MAX', 'FC']
+
+    self.num_caps = 16
+
+    planes = 16 # channels
+    last_size = 6
+
+    if self.mode == 'SR':
+      self.conv_a = tf.keras.Sequential()
+      self.conv_a.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_a.add(tf.keras.layers.Conv2D(self.num_caps,
+                                            kernel_size=[5, 5], strides=1,
+                                            use_bias=False))
+      self.conv_pose = tf.keras.Sequential()
+      self.conv_pose.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_pose.add(tf.keras.layers.Conv2D(self.num_caps * planes,
+                                            kernel_size=[5, 5], strides=1,
+                                            use_bias=False))
+      self.bn_a = tf.keras.layers.BatchNormalization()
+      self.bn_pose = tf.keras.layers.BatchNormalization()
+
+      self.conv_caps = SelfRouting2d(self.num_caps, self.num_caps, planes, planes,
+                                     kernel_size=3, stride=2, padding=1,
+                                     pose_out=True)
+      self.bn_pose_conv_caps = tf.keras.layers.BatchNormalization()
+
+      self.fc_caps = SelfRouting2d(self.num_caps, classes, planes, 1,
+                                   kernel_size=last_size, padding=0, pose_out=False)
+
+    elif self.mode == 'DR':
+      self.conv_pose = tf.keras.Sequential()
+      self.conv_pose.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_pose.add(tf.keras.layers.Conv2D(self.num_caps * planes,
+                                            kernel_size=[5, 5], strides=1,
+                                            use_bias=False))
+
+      self.conv_caps = DynamicRouting2d(self.num_caps, self.num_caps, 16, 16,
+                                        kernel_size=3, stride=2, padding=1,
+                                        std_dev=0.5)
+
+      self.fc_caps = DynamicRouting2d(self.num_caps, classes, 16, 16,
+                                      kernel_size=last_size, padding=0,
+                                      std_dev=0.05)
+
+    elif self.mode == 'EM':
+      self.conv_a = tf.keras.Sequential()
+      self.conv_a.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_a.add(tf.keras.layers.Conv2D(self.num_caps,
+                                            kernel_size=[5, 5], strides=1,
+                                            use_bias=False))
+      self.conv_pose = tf.keras.Sequential()
+      self.conv_pose.add(tf.keras.layers.ZeroPadding2D(padding=1))
+      self.conv_pose.add(tf.keras.layers.Conv2D(self.num_caps * planes,
+                                            kernel_size=[5, 5], strides=1,
+                                            use_bias=False))
+      self.bn_a = tf.keras.layers.BatchNormalization()
+      self.bn_pose = tf.keras.layers.BatchNormalization()
+
+      self.conv_caps = EmRouting2d(self.num_caps, self.num_caps, 16, kernel_size=3,
+                                   stride=2, padding=1)
+      self.bn_pose_conv_caps = tf.keras.layers.BatchNormalization()
+
+      self.fc_caps = EmRouting2d(self.num_caps, classes, 16, kernel_size=last_size,
+                                 padding=0)
+
+    else:
+      raise NotImplementedError
+
+  def call(self, inputs, **kwargs):
+    out = tf.nn.relu(self.bn1(self.conv1(inputs)))
+
+    if self.mode == 'DR':
+      pose = self.conv_pose(out)
+
+      b, c, h, w = tf.shape(pose)
+      pose = tf.transpose([0, 2, 3, 1])
+      pose = squash(tf.reshape(pose, [b, h, w, self.num_caps, 16]))
+      pose = tf.reshape(pose, [b, h, w, -1])
+      pose = tf.transpose(pose, [0, 3, 1, 2])
+
+      pose = self.conv_caps(pose)
+
+      out = self.fc_caps(pose)
+      out = tf.reshape(out, [b, -1, 16])
+      out = length(out, axis=-1)
+
+    elif self.mode == 'EM':
+      a, pose = self.conv_a(out), self.conv_pose(out)
+      a, pose = tf.nn.sigmoid(self.bn_a(a)), self.bn_pose(pose)
+      a, pose = self.conv_caps(a, pose)
+      pose = self.bn_pose_conv_caps(pose)
+
+      a, _ = self.fc_caps(a, pose)
+      out = tf.reshape(a, [tf.shape(out)[0], -1])
+
+    elif self.mode == 'SR':
+      a, pose = self.conv_a(out), self.conv_pose(out)
+      a, pose = tf.nn.sigmoid(self.bn_a(a)), self.bn_pose(pose)
+
+      a, pose = self.conv_caps(a, pose)
+      pose = self.bn_pose_conv_caps(pose)
+
+      a, _ = self.fc_caps(a, pose)
+
+      out = tf.reshape(a, [tf.shape(out)[0], -1])
+      out = tf.math.log(out)
+
+    return out
